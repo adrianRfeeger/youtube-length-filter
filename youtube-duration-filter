@@ -1,0 +1,182 @@
+// ==UserScript==
+// @name         YouTube Filter (Duration + Shorts) – v2.0
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  Filter YouTube by video length & hide Shorts (no gaps, bar always visible)
+// @author       Adrian
+// @match        https://www.youtube.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ——— configuration ——— */
+  const FILTERS = [
+    { label: '< 4 min',   min: 0,    max: 240  },
+    { label: '4–10 min',  min: 240,  max: 600  },
+    { label: '10–30 min', min: 600,  max: 1800 },
+    { label: '30 + min',  min: 1800, max: Infinity },
+    { label: 'Show All',  min: 0,    max: Infinity }
+  ];
+
+  /* ——— state ——— */
+  let activeFilter = { min: 0, max: Infinity };
+  let hideShorts   = false;
+  let gridObserver = null;
+  let barObserver  = null;
+
+  /* ——— helpers ——— */
+  const $  = (sel, ctx = document) => ctx.querySelector(sel);
+  const $$ = (sel, ctx = document) => [...ctx.querySelectorAll(sel)];
+
+  function parseSecs(txt = '') {
+    const p = txt.trim().split(':').map(Number);
+    return p.length === 3 ? p[0]*3600 + p[1]*60 + p[2]
+         : p.length === 2 ? p[0]*60   + p[1]
+         : p[0] || 0;
+  }
+
+  function forceReflow() {
+    const grid = $('ytd-rich-grid-renderer #contents');
+    if (!grid) return;
+    grid.style.display = 'none';
+    // -force layout flush-
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+    grid.offsetHeight;
+    grid.style.display = '';
+  }
+
+  function show(card, yes) {
+    (card.closest('ytd-rich-item-renderer') || card).style.display = yes ? '' : 'none';
+  }
+
+  /* ——— core filter ——— */
+  function applyFilter(min, max) {
+    activeFilter = { min, max };
+
+    const grid = $('ytd-rich-grid-renderer #contents');
+    if (!grid) return;
+
+    $$('ytd-rich-grid-media', grid).forEach(card => {
+      const t   = $('ytd-thumbnail-overlay-time-status-renderer span', card);
+      const sh  = !t;
+
+      if (hideShorts && sh) { show(card, false); return; }
+
+      if (!t) { show(card, true); return; }          // live / ad etc.
+
+      const secs = parseSecs(t.textContent);
+      show(card, secs >= min && secs <= max);
+    });
+
+    $$('ytd-rich-section-renderer').forEach(sec => {
+      sec.style.display = hideShorts ? 'none' : '';
+    });
+
+    $$('#yt-length-filter-bar button[data-filter]').forEach(btn =>
+      btn.classList.toggle(
+        'yt-active',
+        Number(btn.dataset.min) === min && Number(btn.dataset.max) === max
+      )
+    );
+
+    forceReflow();
+  }
+
+  /* ——— UI + styles ——— */
+  function injectCSS() {
+    if ($('#yt-length-filter-style')) return;
+    const css = `
+      #yt-length-filter-bar{
+        display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;margin-bottom:8px;
+        background:var(--yt-spec-general-background-a,#181818);
+        border-bottom:1px solid var(--yt-spec-outline,#303030);z-index:9999
+      }
+      #yt-length-filter-bar button{
+        padding:6px 12px;border:1px solid var(--yt-spec-outline,#555);
+        border-radius:4px;cursor:pointer;font-size:14px;
+        background:var(--yt-spec-10-percent-layer,#272727);
+        color:var(--yt-spec-text-primary,#fff)
+      }
+      #yt-length-filter-bar button:hover{filter:brightness(1.15)}
+      #yt-length-filter-bar button.yt-active{
+        background:var(--yt-spec-underline,#c00);
+        border-color:var(--yt-spec-underline,#c00);
+        color:var(--yt-spec-call-to-action-fg,#fff)
+      }
+      #yt-length-filter-bar #shorts-toggle{border-color:#c33}
+    `;
+    const st = document.createElement('style');
+    st.id = 'yt-length-filter-style';
+    st.textContent = css;
+    document.head.appendChild(st);
+  }
+
+  function buildBar() {
+    if ($('#yt-length-filter-bar')) return;
+
+    const renderer = $('ytd-rich-grid-renderer');
+    if (!renderer) return;                       // grid not ready yet
+
+    injectCSS();
+
+    const bar = document.createElement('div');
+    bar.id = 'yt-length-filter-bar';
+
+    FILTERS.forEach(({ label, min, max }) => {
+      const b = document.createElement('button');
+      b.textContent   = label;
+      b.dataset.min   = min;
+      b.dataset.max   = max;
+      b.dataset.filter = 'duration';
+      b.addEventListener('click', () => applyFilter(min, max));
+      bar.appendChild(b);
+    });
+
+    const shorts = document.createElement('button');
+    shorts.id = 'shorts-toggle';
+    shorts.textContent = 'Hide Shorts';
+    shorts.addEventListener('click', () => {
+      hideShorts = !hideShorts;
+      shorts.textContent = hideShorts ? 'Show Shorts' : 'Hide Shorts';
+      applyFilter(activeFilter.min, activeFilter.max);
+    });
+    bar.appendChild(shorts);
+
+    renderer.parentNode.insertBefore(bar, renderer);
+  }
+
+  /* ——— observers ——— */
+  function keepBarAlive() {
+    if (barObserver) return;
+    barObserver = new MutationObserver(() => buildBar());
+    barObserver.observe(document.body, { childList:true, subtree:true });
+  }
+
+  function watchGrid() {
+    const grid = $('ytd-rich-grid-renderer #contents');
+    if (!grid || gridObserver) return;
+    gridObserver = new MutationObserver(() => applyFilter(activeFilter.min, activeFilter.max));
+    gridObserver.observe(grid, { childList:true, subtree:true });
+  }
+
+  /* ——— bootstrap ——— */
+  function init() {
+    const ok = ['/', '/feed/subscriptions'];
+    if (!ok.includes(location.pathname)) return;
+    buildBar();
+    keepBarAlive();
+    watchGrid();
+    applyFilter(activeFilter.min, activeFilter.max);
+  }
+
+  // first load
+  init();
+
+  // SPA navigation
+  window.addEventListener('yt-page-data-updated', () => {
+    gridObserver = null;
+    setTimeout(init, 500);
+  });
+})();
